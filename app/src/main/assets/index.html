@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Discord LAN Voice Call</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background: #313338; color: #DBDEE1; min-height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+    .header { height: 48px; background: #2B2D31; border-bottom: 1px solid #1E1F22; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; font-weight: bold; font-size: 14px; }
+    .badge { font-size: 11px; color: #23A55A; background: rgba(35,165,90,0.15); padding: 3px 8px; border-radius: 4px; font-family: monospace; }
+    .grid { flex: 1; padding: 16px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; overflow-y: auto; }
+    .user-card { background: #2B2D31; border: 2px solid #1E1F22; border-radius: 16px; width: 100%; max-width: 320px; aspect-ratio: 4/3; display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative; transition: all 0.15s; }
+    .user-card.speaking { border-color: #23A55A; box-shadow: 0 0 20px rgba(35,165,90,0.5); }
+    .avatar { width: 84px; height: 84px; border-radius: 50%; background: linear-gradient(135deg, #10B981, #0D9488); display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: bold; color: white; margin-bottom: 12px; }
+    .name { font-size: 13px; font-weight: 600; color: white; background: #1E1F22; padding: 4px 12px; border-radius: 12px; }
+    .meter { position: absolute; bottom: 12px; width: 120px; height: 4px; background: #1E1F22; border-radius: 2px; overflow: hidden; }
+    .meter-bar { height: 100%; width: 0%; background: #23A55A; transition: width 0.05s linear; }
+    .controls { height: 72px; background: #2B2D31; border-top: 1px solid #1E1F22; display: flex; align-items: center; justify-content: center; gap: 16px; }
+    .btn { width: 48px; height: 48px; border-radius: 50%; border: none; background: #35373C; color: white; font-size: 18px; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+    .btn.active { background: #DA373C; }
+    .btn-ptt { width: auto; border-radius: 24px; padding: 0 20px; font-size: 13px; font-weight: bold; background: #5865F2; }
+    .server-input { width: 100%; max-width: 320px; padding: 8px 12px; background: #1E1F22; border: 1px solid #3f4147; border-radius: 8px; color: white; font-size: 12px; margin-bottom: 8px; font-family: monospace; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div>🔊 general-voice</div>
+    <div id="status" class="badge">Connecting...</div>
+  </div>
+
+  <div class="grid">
+    <input id="serverUrl" class="server-input" placeholder="Server URL e.g. wss://... or ws://192.168.1.5:3000" />
+    <div id="card" class="user-card">
+      <div class="avatar">📱</div>
+      <div class="name">My Phone (Android APK)</div>
+      <div class="meter"><div id="meterBar" class="meter-bar"></div></div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <button id="muteBtn" class="btn">🎤</button>
+    <button id="pttBtn" class="btn btn-ptt">Hold to Talk</button>
+  </div>
+
+  <script>
+    let ws, audioCtx, micStream, processor, isMuted = false, isSpeaking = false;
+    const statusEl = document.getElementById('status');
+    const cardEl = document.getElementById('card');
+    const barEl = document.getElementById('meterBar');
+    const muteBtn = document.getElementById('muteBtn');
+    const pttBtn = document.getElementById('pttBtn');
+    const serverInput = document.getElementById('serverUrl');
+
+    const defaultUrl = window.location.origin.replace(/^http/, 'ws') + '/ws/voice';
+    serverInput.value = defaultUrl.startsWith('file:') ? 'wss://ais-dev-e5o347hiz63hlzojwrusen-829172823940.asia-east1.run.app/ws/voice' : defaultUrl;
+
+    function connect() {
+      const url = serverInput.value.trim();
+      statusEl.textContent = 'Connecting...';
+      try {
+        ws = new WebSocket(url);
+        ws.binaryType = 'arraybuffer';
+        ws.onopen = () => {
+          statusEl.textContent = 'Voice Connected (LAN)';
+          ws.send(JSON.stringify({
+            type: 'join',
+            payload: { id: 'phone-apk-' + Math.random().toString(36).substr(2,6), name: 'My Phone (Android APK)', deviceType: 'apk', channelId: 'general-voice' }
+          }));
+          initAudio();
+        };
+        ws.onmessage = (e) => {
+          if (e.data instanceof ArrayBuffer && audioCtx) {
+            playPcm(e.data);
+          }
+        };
+        ws.onclose = () => {
+          statusEl.textContent = 'Disconnected';
+          setTimeout(connect, 3000);
+        };
+      } catch (e) {
+        statusEl.textContent = 'Connection Error';
+      }
+    }
+
+    async function initAudio() {
+      try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+        const src = audioCtx.createMediaStreamSource(micStream);
+        processor = audioCtx.createScriptProcessor(1024, 1, 1);
+
+        processor.onaudioprocess = (e) => {
+          if (isMuted) {
+            barEl.style.width = '0%';
+            cardEl.classList.remove('speaking');
+            return;
+          }
+          const inp = e.inputBuffer.getChannelData(0);
+          let sum = 0;
+          const pcm = new Int16Array(inp.length);
+          for (let i = 0; i < inp.length; i++) {
+            const s = Math.max(-1, Math.min(1, inp[i]));
+            sum += s * s;
+            pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+          }
+          const rms = Math.sqrt(sum / inp.length);
+          const vol = Math.min(100, Math.round(rms * 400));
+          barEl.style.width = vol + '%';
+
+          const speakingNow = vol > 12;
+          if (speakingNow !== isSpeaking) {
+            isSpeaking = speakingNow;
+            if (isSpeaking) cardEl.classList.add('speaking');
+            else cardEl.classList.remove('speaking');
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'speaking', isSpeaking }));
+            }
+          }
+
+          if (isSpeaking && ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(pcm.buffer);
+          }
+        };
+
+        src.connect(processor);
+        processor.connect(audioCtx.destination);
+      } catch (err) {
+        statusEl.textContent = 'Mic Error: ' + err.message;
+      }
+    }
+
+    let nextTime = 0;
+    function playPcm(buf) {
+      if (!audioCtx) return;
+      const int16 = new Int16Array(buf);
+      const audioBuf = audioCtx.createBuffer(1, int16.length, 16000);
+      const chan = audioBuf.getChannelData(0);
+      for (let i = 0; i < int16.length; i++) chan[i] = int16[i] / 32768.0;
+      const src = audioCtx.createBufferSource();
+      src.buffer = audioBuf;
+      src.connect(audioCtx.destination);
+      const now = audioCtx.currentTime;
+      if (nextTime < now) nextTime = now + 0.01;
+      src.start(nextTime);
+      nextTime += audioBuf.duration;
+    }
+
+    muteBtn.onclick = () => {
+      isMuted = !isMuted;
+      muteBtn.classList.toggle('active', isMuted);
+      muteBtn.textContent = isMuted ? '🔇' : '🎤';
+    };
+
+    serverInput.onchange = () => {
+      if (ws) ws.close();
+      connect();
+    };
+
+    connect();
+  </script>
+</body>
+</html>
